@@ -1,0 +1,21 @@
+.env
+.env.*
+target/
+node_modules/
+venv/
+__pycache__/
+*.log
+# Rust
+/target
+**/*.rs.bk
+
+# Env files (secrets!)
+.env
+.env.*
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+config.json

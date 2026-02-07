@@ -1,0 +1,302 @@
+use crate::client::{PolymarketClient, SignedOrderPayload};
+use crate::config::TradingConfig;
+use crate::domain::*;
+use crate::wallet::signer::{ClobOrder, WalletSigner};
+use anyhow::{anyhow, Result};
+use log::{info, warn};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
+use ethers::types::{H256, U256};
+use ethers::utils::keccak256;
+
+// --------------------------------------------------
+// Helpers for Polymarket CLOB EIP-712
+// --------------------------------------------------
+
+fn str_to_h256(s: &str) -> H256 {
+    H256::from_slice(&keccak256(s.as_bytes()))
+}
+
+fn to_u256_scaled(value: &str) -> U256 {
+    let v: f64 = value.parse().unwrap_or(0.0);
+    U256::from((v * 1_000_000.0) as u128)
+}
+
+#[derive(Clone)]
+struct CachedMarketData {
+    market: MarketDetails,
+    cached_at: Instant,
+}
+
+pub struct Trader {
+    api: Arc<PolymarketClient>,
+    config: TradingConfig,
+    read_only: bool,
+    signer: Option<WalletSigner>, // 👈 SIGNER WIRED HERE
+
+    total_profit: Arc<Mutex<f64>>,
+    trades_executed: Arc<Mutex<u64>>,
+    pending_trades: Arc<Mutex<HashMap<String, PendingTrade>>>,
+    market_cache: Arc<Mutex<HashMap<String, CachedMarketData>>>,
+}
+
+impl Trader {
+    pub fn new(
+        api: Arc<PolymarketClient>,
+        config: TradingConfig,
+        read_only: bool,
+        signer: Option<WalletSigner>, // 👈 PASSED FROM main.rs
+    ) -> Self {
+        if read_only {
+            warn!("🔒 Trader initialized in READ-ONLY mode");
+        }
+
+        Self {
+            api,
+            config,
+            read_only,
+            signer,
+            total_profit: Arc::new(Mutex::new(0.0)),
+            trades_executed: Arc::new(Mutex::new(0)),
+            pending_trades: Arc::new(Mutex::new(HashMap::new())),
+            market_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    // --------------------------------------------------
+    // Pending trade settlement
+    // --------------------------------------------------
+    pub async fn check_pending_trades(&self) -> Result<()> {
+        let mut pending = self.pending_trades.lock().await;
+        let mut to_remove = Vec::new();
+
+        let min_age = Duration::from_secs(14 * 60);
+
+        for (key, trade) in pending.iter() {
+            if trade.timestamp.elapsed() < min_age {
+                continue;
+            }
+
+            let (eth_closed, eth_winner) = self
+                .check_market_result_cached(
+                    &trade.eth_condition_id,
+                    &trade.eth_token_id,
+                )
+                .await?;
+
+            let (btc_closed, btc_winner) = self
+                .check_market_result_cached(
+                    &trade.btc_condition_id,
+                    &trade.btc_token_id,
+                )
+                .await?;
+
+            if eth_closed && btc_closed {
+                let pnl =
+                    self.calculate_actual_profit(trade, eth_winner, btc_winner);
+
+                *self.total_profit.lock().await += pnl;
+
+                info!(
+                    "💰 SETTLED | ETH: {} | BTC: {} | PnL: ${:.4}",
+                    if eth_winner { "WON" } else { "LOST" },
+                    if btc_winner { "WON" } else { "LOST" },
+                    pnl
+                );
+
+                to_remove.push(key.clone());
+            }
+        }
+
+        for key in to_remove {
+            pending.remove(&key);
+        }
+
+        Ok(())
+    }
+
+    async fn check_market_result_cached(
+        &self,
+        condition_id: &str,
+        token_id: &str,
+    ) -> Result<(bool, bool)> {
+        let ttl = Duration::from_secs(60);
+
+        if let Some(cached) = self.market_cache.lock().await.get(condition_id) {
+            if cached.cached_at.elapsed() < ttl {
+                return Ok(self.extract_market_result(&cached.market, token_id));
+            }
+        }
+
+        match self.api.get_market(condition_id).await {
+            Ok(market) => {
+                self.market_cache.lock().await.insert(
+                    condition_id.to_string(),
+                    CachedMarketData {
+                        market: market.clone(),
+                        cached_at: Instant::now(),
+                    },
+                );
+
+                Ok(self.extract_market_result(&market, token_id))
+            }
+            Err(e) => {
+                warn!("Failed to fetch market {}: {}", condition_id, e);
+                Ok((false, false))
+            }
+        }
+    }
+
+    fn extract_market_result(
+        &self,
+        market: &MarketDetails,
+        token_id: &str,
+    ) -> (bool, bool) {
+        if market.accepting_orders {
+            return (false, false);
+        }
+
+        let winner = market
+            .tokens
+            .iter()
+            .find(|t| t.token_id == token_id)
+            .map(|t| t.winner)
+            .unwrap_or(false);
+
+        (true, winner)
+    }
+
+    fn calculate_actual_profit(
+        &self,
+        trade: &PendingTrade,
+        eth_winner: bool,
+        btc_winner: bool,
+    ) -> f64 {
+        let payout = match (eth_winner, btc_winner) {
+            (true, true) => 2.0,
+            (true, false) | (false, true) => 1.0,
+            _ => 0.0,
+        };
+
+        payout * trade.units - trade.investment_amount
+    }
+
+    // --------------------------------------------------
+    // Arbitrage execution (SIGNED)
+    // --------------------------------------------------
+    pub async fn execute_arbitrage(
+        &self,
+        opportunity: &ArbitrageOpportunity,
+    ) -> Result<()> {
+        // 🔒 HARD SAFETY GATE
+        if self.read_only {
+            info!("🧪 READ-ONLY: arbitrage detected — not executing");
+            return Ok(());
+        }
+
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| anyhow!("Signer missing but read_only = false"))?;
+
+        let position_size = self.calculate_position_size(opportunity);
+        let size_str = format!("{:.6}", position_size);
+
+        let now = std::time::SystemTime::now()
+             .duration_since(std::time::UNIX_EPOCH)
+             .unwrap()
+             .as_secs();
+
+        // ---------------- ETH ORDER ----------------
+        let eth_eip712 = ClobOrder {
+            token_id: opportunity.eth_up_token_id.clone(),
+            side: "BUY".into(),
+            price: opportunity.eth_up_price.to_string(),
+            size: size_str.clone(),
+            expiration: now + 300, // 5 min
+            nonce: rand::random(),
+        };
+
+        let eth_sig = signer.sign_order(&eth_eip712).await?;
+
+        let eth_order = OrderRequest {
+            token_id: opportunity.eth_up_token_id.clone(),
+            side: "BUY".into(),
+            size: size_str.clone(),
+            price: opportunity.eth_up_price.to_string(),
+            order_type: "LIMIT".into(),
+        };
+
+        let eth_payload = SignedOrderPayload {
+            order: eth_order,
+            signature: eth_sig.to_string(),
+            address: signer.address().to_string(),
+        };
+
+        // ---------------- BTC ORDER ----------------
+        let btc_eip712 = ClobOrder {
+            token_id: opportunity.btc_down_token_id.clone(),
+            side: "BUY".into(),
+            price: opportunity.btc_down_price.to_string(),
+            size: size_str.clone(),
+            expiration: now + 300,
+            nonce: rand::random(),
+        };
+
+        let btc_sig = signer.sign_order(&btc_eip712).await?;
+
+        let btc_order = OrderRequest {
+            token_id: opportunity.btc_down_token_id.clone(),
+            side: "BUY".into(),
+            size: size_str,
+            price: opportunity.btc_down_price.to_string(),
+            order_type: "LIMIT".into(),
+        };
+
+        let btc_payload = SignedOrderPayload {
+            order: btc_order,
+            signature: btc_sig.to_string(),
+            address: signer.address().to_string(),
+        };
+
+        // 🚀 PLACE SIGNED ORDERS
+        let _ = tokio::join!(
+            self.api.place_signed_order(&eth_payload),
+            self.api.place_signed_order(&btc_payload),
+        );
+
+        let units =
+            position_size / f64::try_from(opportunity.total_cost).unwrap_or(1.0);
+
+        let key = format!(
+            "{}_{}",
+            opportunity.eth_condition_id,
+            opportunity.btc_condition_id
+        );
+
+        self.pending_trades.lock().await.insert(
+            key,
+            PendingTrade {
+                eth_token_id: opportunity.eth_up_token_id.clone(),
+                btc_token_id: opportunity.btc_down_token_id.clone(),
+                eth_condition_id: opportunity.eth_condition_id.clone(),
+                btc_condition_id: opportunity.btc_condition_id.clone(),
+                investment_amount: position_size,
+                units,
+                timestamp: Instant::now(),
+            },
+        );
+
+        *self.trades_executed.lock().await += 1;
+
+        Ok(())
+    }
+
+    fn calculate_position_size(&self, opportunity: &ArbitrageOpportunity) -> f64 {
+        let max = self.config.max_position_size;
+        let cost = f64::try_from(opportunity.total_cost).unwrap_or(1.0);
+        (max / cost * cost).min(max)
+    }
+}
